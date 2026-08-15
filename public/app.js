@@ -17,21 +17,31 @@ const IMAGE_EXTENSIONS = {
   "image/png": "png",
   "image/webp": "webp",
 };
+// Capabilities each agent CLI can actually back. Slash commands and composer
+// tools are gated on these instead of on the provider name.
+const PROVIDER_CAPABILITIES = {
+  codex: new Set(["plan", "goal", "compact", "usage", "context", "instructions"]),
+  claude: new Set(["plan", "goal", "compact", "usage", "context", "instructions"]),
+};
+
 const SLASH_COMMANDS = [
   {
     name: "goal",
     label: "Goal mode",
-    description: "تعیین هدفی که Codex در چند نوبت تا رسیدن به نتیجه پیگیری کند",
+    description: "تعیین هدفی که عامل در چند نوبت تا رسیدن به نتیجه پیگیری کند",
+    capability: "goal",
   },
   {
     name: "plan",
     label: "Plan mode",
     description: "روشن یا خاموش‌کردن حالت بررسی و برنامه‌ریزی قبل از اجرا",
+    capability: "plan",
   },
   {
     name: "compact",
     label: "فشرده‌سازی گفتگو",
     description: "خلاصه‌کردن context فعلی و آزادکردن فضای گفتگو",
+    capability: "compact",
   },
   {
     name: "new",
@@ -55,8 +65,9 @@ const SLASH_COMMANDS = [
   },
   {
     name: "usage",
-    label: "مصرف Codex",
+    label: "مصرف حساب",
     description: "نمایش سهمیه، محدودیت فعال و زمان بازنشانی",
+    capability: "usage",
   },
   {
     name: "model",
@@ -401,6 +412,9 @@ const state = {
   rateLimits: null,
   rateLimitsFetchedAt: 0,
   rateLimitsLoading: false,
+  // Codex and Claude report quota separately, so a snapshot is only valid for
+  // the provider it came from.
+  rateLimitsProvider: "",
   notifiedRateLimitKey: null,
   usageClockTimer: null,
   urlHydrationActiveKey: null,
@@ -488,6 +502,18 @@ function effectiveProvider() {
   return urlThreadId ? providerForThread(urlThreadId) : state.settings.provider;
 }
 
+function providerSupports(capability, provider = effectiveProvider()) {
+  return PROVIDER_CAPABILITIES[provider]?.has(capability) ?? false;
+}
+
+function providerSupportsPlanMode(provider = effectiveProvider()) {
+  return providerSupports("plan", provider);
+}
+
+function providerSupportsGoalMode(provider = effectiveProvider()) {
+  return providerSupports("goal", provider);
+}
+
 async function rpc(method, params = {}) {
   const response = await api("/api/rpc", {
     method: "POST",
@@ -523,6 +549,16 @@ function slashCommandByName(name) {
   return SLASH_COMMANDS.find((command) => command.name === name) || null;
 }
 
+function slashCommandSupportsProvider(command, provider = effectiveProvider()) {
+  return !command.capability || providerSupports(command.capability, provider);
+}
+
+function slashCommandsForProvider(provider = effectiveProvider()) {
+  return SLASH_COMMANDS.filter((command) =>
+    slashCommandSupportsProvider(command, provider),
+  );
+}
+
 function parseSlashCommand(text) {
   const raw = String(text || "");
   const candidate = raw.trimStart();
@@ -552,8 +588,11 @@ function parseSlashCommand(text) {
 
 function slashCommandAvailability(command) {
   if (state.navigating) return { available: false, reason: "تا پایان بازشدن گفتگو صبر کنید." };
-  if (["goal", "plan"].includes(command.name) && effectiveProvider() !== "codex") {
-    return { available: false, reason: "این حالت فقط برای گفتگوهای Codex در دسترس است." };
+  if (!slashCommandSupportsProvider(command)) {
+    return {
+      available: false,
+      reason: `فرمان ${command.token} برای گفتگوهای ${providerLabel(effectiveProvider())} پشتیبانی نمی‌شود.`,
+    };
   }
   if (state.slashCommandExecuting && command.name === "compact") {
     return { available: false, reason: "یک فرمان دیگر در حال اجراست." };
@@ -562,13 +601,12 @@ function slashCommandAvailability(command) {
     if (!state.currentThreadId) {
       return { available: false, reason: "ابتدا یک گفتگو را شروع یا باز کنید." };
     }
-    if (effectiveProvider() !== "codex") {
+    if (!state.connected) {
       return {
         available: false,
-        reason: "فشرده‌سازی context فقط برای گفتگوهای Codex پشتیبانی می‌شود.",
+        reason: `${providerLabel(effectiveProvider())} هنوز متصل نیست.`,
       };
     }
-    if (!state.connected) return { available: false, reason: "Codex هنوز متصل نیست." };
     if (state.busy || state.compactPendingThreads.has(state.currentThreadId)) {
       return { available: false, reason: "پس از پایان کار فعلی دوباره امتحان کنید." };
     }
@@ -615,7 +653,7 @@ function updateSlashCommandMenu({ keepActiveCommand = true } = {}) {
   const previousActive = keepActiveCommand
     ? state.slashFilteredCommands[state.slashActiveIndex]?.name
     : null;
-  state.slashFilteredCommands = SLASH_COMMANDS.filter((command) =>
+  state.slashFilteredCommands = slashCommandsForProvider().filter((command) =>
     command.name.includes(query),
   );
   const previousIndex = previousActive
@@ -823,7 +861,29 @@ function exactResetTime(timestamp) {
   });
 }
 
-function rateLimitBuckets(data = state.rateLimits) {
+// Claude Code exposes the active quota window and its reset time but never a
+// used percentage, so the card states what is known instead of charting zero.
+function unmeasuredLimitText(bucket) {
+  const parts = [
+    bucket.allowed === false
+      ? `${formatWindowDuration(bucket.windowDurationMins)} پر شده است`
+      : `${formatWindowDuration(bucket.windowDurationMins)} فعال است`,
+  ];
+  if (bucket.isUsingOverage) parts.push("در حال استفاده از سهمیهٔ اضافه");
+  if (bucket.resetsAt) {
+    parts.push(
+      `بازنشانی ${relativeResetTime(bucket.resetsAt)} · ${exactResetTime(bucket.resetsAt)}`,
+    );
+  }
+  parts.push("درصد مصرف را Claude Code گزارش نمی‌کند");
+  return parts.join(" · ");
+}
+
+function currentRateLimits() {
+  return state.rateLimitsProvider === effectiveProvider() ? state.rateLimits : null;
+}
+
+function rateLimitBuckets(data = currentRateLimits()) {
   const buckets = Object.values(data?.rateLimitsByLimitId || {}).filter(Boolean);
   if (buckets.length) return buckets;
   return data?.rateLimits ? [data.rateLimits] : [];
@@ -844,7 +904,7 @@ function rateLimitReachedReason(bucket) {
   return "";
 }
 
-function rateLimitSummary(data = state.rateLimits) {
+function rateLimitSummary(data = currentRateLimits()) {
   const buckets = rateLimitBuckets(data);
   const windows = buckets.flatMap(rateLimitWindows);
   const maxUsed = windows.length
@@ -852,8 +912,11 @@ function rateLimitSummary(data = state.rateLimits) {
     : null;
   const reachedBucket = buckets.find((bucket) => rateLimitReachedReason(bucket));
   const reachedReason = reachedBucket ? rateLimitReachedReason(reachedBucket) : "";
-  const resetCandidates = (reachedBucket ? rateLimitWindows(reachedBucket) : windows)
-    .map((window) => Number(window.resetsAt))
+  const resetSources = reachedBucket
+    ? [...rateLimitWindows(reachedBucket), reachedBucket]
+    : [...windows, ...buckets];
+  const resetCandidates = resetSources
+    .map((source) => Number(source.resetsAt))
     .filter((timestamp) => Number.isFinite(timestamp) && timestamp > 0)
     .sort((left, right) => left - right);
   return {
@@ -898,7 +961,9 @@ function renderContextUsage() {
     return;
   }
   if (!Number.isFinite(usedTokens)) {
-    elements.contextUsageDetail.textContent = "Codex هنوز آمار Context این گفت‌وگو را گزارش نکرده است.";
+    elements.contextUsageDetail.textContent = `${providerLabel(
+      effectiveProvider(),
+    )} هنوز آمار Context این گفت‌وگو را گزارش نکرده است.`;
     return;
   }
 
@@ -938,7 +1003,7 @@ function renderUsageAccountDetails(buckets) {
     appendUsageAccountDetail(details, "اعتبار باقی‌مانده", String(credits.balance || "۰"));
   }
 
-  const resetCredits = state.rateLimits?.rateLimitResetCredits;
+  const resetCredits = currentRateLimits()?.rateLimitResetCredits;
   if (Number(resetCredits?.availableCount) > 0) {
     appendUsageAccountDetail(
       details,
@@ -964,7 +1029,7 @@ function renderUsageLimits() {
   updateUsageButton();
   elements.usageLimits.replaceChildren();
 
-  if (state.rateLimitsLoading && !state.rateLimits) {
+  if (state.rateLimitsLoading && !currentRateLimits()) {
     elements.usageOverview.classList.remove("hidden");
     elements.usageOverview.textContent = "در حال دریافت اطلاعات حساب…";
     const loading = document.createElement("p");
@@ -1050,7 +1115,9 @@ function renderUsageLimits() {
     if (!rateLimitWindows(bucket).length) {
       const note = document.createElement("p");
       note.className = "usage-empty";
-      note.textContent = reachedReason || "جزئیات بازه گزارش نشده است.";
+      note.textContent = bucket.usageUnavailable
+        ? unmeasuredLimitText(bucket)
+        : reachedReason || "جزئیات بازه گزارش نشده است.";
       card.append(note);
     }
     elements.usageLimits.append(card);
@@ -1076,9 +1143,13 @@ function mergeRateLimitSnapshot(previous, incoming) {
   };
 }
 
-function applyRateLimits(data, { notify = false } = {}) {
-  const previous = state.rateLimits || {};
+function applyRateLimits(data, { notify = false, provider = "" } = {}) {
   const incoming = data || {};
+  const source = provider || incoming.provider || "codex";
+  // A snapshot from another agent must replace, never merge into, the current one.
+  const previous = state.rateLimitsProvider === source ? state.rateLimits || {} : {};
+  if (state.rateLimitsProvider !== source) state.notifiedRateLimitKey = null;
+  state.rateLimitsProvider = source;
   const next = {
     ...previous,
     ...incoming,
@@ -1117,19 +1188,22 @@ function applyRateLimits(data, { notify = false } = {}) {
 }
 
 async function refreshRateLimits({ force = false, silent = false } = {}) {
+  const provider = effectiveProvider();
+  if (!providerSupports("usage", provider)) return;
   if (state.rateLimitsLoading) return;
-  if (!force && Date.now() - state.rateLimitsFetchedAt < 15_000) return;
+  const stale = state.rateLimitsProvider !== provider;
+  if (!force && !stale && Date.now() - state.rateLimitsFetchedAt < 15_000) return;
   state.rateLimitsLoading = true;
   state.rateLimitError = null;
   renderUsageLimits();
   elements.usageRefresh.disabled = true;
   try {
-    const result = await rpc("account/rateLimits/read", { provider: "codex" });
-    applyRateLimits(result, { notify: true });
+    const result = await rpc("account/rateLimits/read", { provider });
+    applyRateLimits(result, { notify: true, provider });
   } catch (error) {
     state.rateLimitError = error;
     renderUsageLimits();
-    if (!silent) showError(error, "دریافت سهمیهٔ Codex");
+    if (!silent) showError(error, `دریافت سهمیهٔ ${providerLabel(provider)}`);
   } finally {
     state.rateLimitsLoading = false;
     elements.usageRefresh.disabled = false;
@@ -1140,7 +1214,7 @@ async function refreshRateLimits({ force = false, silent = false } = {}) {
 function openUsageDialog() {
   if (!elements.usageDialog.open) elements.usageDialog.showModal();
   renderUsageLimits();
-  if (!state.rateLimits || Date.now() - state.rateLimitsFetchedAt > 60_000) {
+  if (!currentRateLimits() || Date.now() - state.rateLimitsFetchedAt > 60_000) {
     void refreshRateLimits({ force: true });
   }
   clearInterval(state.usageClockTimer);
@@ -1180,8 +1254,10 @@ function showSlashStatus() {
     rows.push(
       ["Sandbox", readableSandbox(runtime.sandbox || state.settings.sandbox)],
       ["Approval", readableApproval(runtime.approvalPolicy || state.settings.approvalPolicy)],
-      ["Context", contextUsageText(usage)],
     );
+  }
+  if (providerSupports("context", provider)) {
+    rows.push(["Context", contextUsageText(usage)]);
   }
   const card = renderLocalCommandCard(`وضعیت ${label}`);
   const list = document.createElement("dl");
@@ -1196,10 +1272,12 @@ function showSlashStatus() {
 }
 
 function showSlashHelp() {
-  const card = renderLocalCommandCard("فرمان‌های پشتیبانی‌شده");
+  const card = renderLocalCommandCard(
+    `فرمان‌های پشتیبانی‌شده برای ${providerLabel(effectiveProvider())}`,
+  );
   const list = document.createElement("ul");
   list.className = "local-command-help";
-  for (const command of SLASH_COMMANDS) {
+  for (const command of slashCommandsForProvider()) {
     const item = document.createElement("li");
     const token = document.createElement("code");
     token.textContent = command.token;
@@ -1245,7 +1323,9 @@ async function runCompactSlashCommand(command) {
     } else {
       clearSlashCommandText(command.token, targetDraftKey);
       toast(
-        "Codex فشرده‌سازی را شروع کرده است، اما پاسخ تأیید آن به رابط نرسید.",
+        `${providerLabel(
+          providerForThread(threadId),
+        )} فشرده‌سازی را شروع کرده است، اما پاسخ تأیید آن به رابط نرسید.`,
         "warning",
         { duration: 7000 },
       );
@@ -1255,8 +1335,9 @@ async function runCompactSlashCommand(command) {
       error.details?.code === -32601 ||
       /method not found|does not provide|not supported/i.test(error.message || "");
     if (unsupported) {
+      const label = providerLabel(providerForThread(threadId));
       toast(
-        "این نسخهٔ Codex از فشرده‌سازی بومی پشتیبانی نمی‌کند؛ Codex CLI را به‌روز کنید.",
+        `این نسخهٔ ${label} از فشرده‌سازی بومی پشتیبانی نمی‌کند؛ ${label} CLI را به‌روز کنید.`,
         "error",
         { duration: 7000 },
       );
@@ -2698,16 +2779,20 @@ function closeComposerToolsMenu() {
 
 function updateComposerModeUi() {
   const provider = effectiveProvider();
-  const codex = provider === "codex";
-  const plan = codex && composerModeFor() === "plan";
-  const goal = codex ? goalFor() : null;
-  elements.planModeOption.disabled = !codex;
-  elements.goalModeOption.disabled = !codex;
+  const planSupported = providerSupportsPlanMode(provider);
+  const goalSupported = providerSupportsGoalMode(provider);
+  const plan = planSupported && composerModeFor() === "plan";
+  const goal = goalSupported ? goalFor() : null;
+  elements.planModeOption.disabled = !planSupported;
+  elements.goalModeOption.disabled = !goalSupported;
   elements.planModeOption.setAttribute("aria-checked", String(plan));
-  elements.composerToolsNote.classList.toggle("hidden", codex);
+  elements.composerToolsNote.classList.toggle(
+    "hidden",
+    planSupported && goalSupported,
+  );
   elements.composerTools.classList.toggle("active-mode", Boolean(plan || goal));
-  const toolLabel = !codex
-    ? "Plan و Goal فقط برای Codex در دسترس‌اند"
+  const toolLabel = !planSupported && !goalSupported
+    ? `Plan و Goal برای ${providerLabel(provider)} در دسترس نیستند`
     : plan
       ? "ابزارهای گفتگو؛ Plan mode روشن است"
       : goal
@@ -2725,8 +2810,9 @@ function toggleComposerToolsMenu() {
 }
 
 function togglePlanMode() {
-  if (effectiveProvider() !== "codex") {
-    toast("Plan mode فقط در گفتگوهای Codex در دسترس است.", "warning");
+  const provider = effectiveProvider();
+  if (!providerSupportsPlanMode(provider)) {
+    toast(`Plan mode برای ${providerLabel(provider)} در دسترس نیست.`, "warning");
     return false;
   }
   const key = draftKey();
@@ -2802,7 +2888,7 @@ function formatGoalUsage(goal) {
 }
 
 function renderGoalProgress() {
-  const goal = effectiveProvider() === "codex" ? goalFor() : null;
+  const goal = providerSupportsGoalMode() ? goalFor() : null;
   elements.goalProgress.classList.toggle("hidden", !goal);
   if (!goal) {
     elements.goalProgress.removeAttribute("data-status");
@@ -2839,7 +2925,7 @@ function renderGoalProgress() {
 }
 
 async function loadGoal(threadId) {
-  if (!threadId || providerForThread(threadId) !== "codex") return null;
+  if (!threadId || !providerSupportsGoalMode(providerForThread(threadId))) return null;
   if (state.goalLoadingThreads.has(threadId)) return null;
   state.goalLoadingThreads.add(threadId);
   try {
@@ -2857,8 +2943,9 @@ async function loadGoal(threadId) {
 
 function openGoalDialog() {
   closeComposerToolsMenu();
-  if (effectiveProvider() !== "codex") {
-    toast("Goal mode فقط در گفتگوهای Codex در دسترس است.", "warning");
+  const provider = effectiveProvider();
+  if (!providerSupportsGoalMode(provider)) {
+    toast(`Goal mode برای ${providerLabel(provider)} در دسترس نیست.`, "warning");
     return;
   }
   const goal = goalFor();
@@ -2987,6 +3074,10 @@ function migrateComposerState(sourceKey, targetKey) {
 async function activatePendingGoal(threadId) {
   const pending = state.pendingGoals.get(threadId);
   if (!pending) return null;
+  if (!providerSupportsGoalMode(providerForThread(threadId))) {
+    state.pendingGoals.delete(threadId);
+    return null;
+  }
   const result = await rpc("thread/goal/set", {
     threadId,
     objective: pending.objective,
@@ -3323,6 +3414,9 @@ function setCurrentThread(thread, metadata = {}) {
   if (metadata.model || thread.model) runtime.model = metadata.model || thread.model;
   if (thread.permissionMode) runtime.permissionMode = thread.permissionMode;
   state.threadRuntime.set(thread.id, runtime);
+  if (metadata.tokenUsage !== undefined) {
+    state.threadTokenUsage.set(thread.id, metadata.tokenUsage || null);
+  }
   syncThreadActivity(thread);
   markThreadSeen(thread.id);
   elements.threadTitle.textContent = threadDisplayTitle(thread);
@@ -4418,17 +4512,23 @@ async function sendPrompt(
       threadId,
       provider,
     };
-    if (provider === "codex" && composerModeFor(threadId) === "plan") {
+    const planMode =
+      providerSupportsPlanMode(provider) && composerModeFor(threadId) === "plan";
+    if (planMode && provider === "codex") {
       const collaborationMode = planCollaborationMode();
       if (!collaborationMode) {
         throw new Error("برای Plan mode ابتدا یک مدل Codex انتخاب یا بارگذاری کنید.");
       }
       params.collaborationMode = collaborationMode;
     }
-    if (provider === "codex") {
+    if (planMode && provider === "claude") {
+      // Claude Code has no collaboration mode; plan mode is a permission mode.
+      params.permissionMode = "plan";
+    }
+    if (providerSupports("instructions", provider)) {
       const project = projectById(state.threadProjects.get(threadId));
       const instructions = projectInstructions(project, {
-        includeResponseStyle: !params.collaborationMode,
+        includeResponseStyle: !planMode,
       });
       if (instructions) params.developerInstructions = instructions;
     }
@@ -4653,7 +4753,12 @@ function handleNotification(message) {
   }
 
   if (method === "account/rateLimits/updated") {
-    applyRateLimits(params, { notify: true });
+    const source = params.provider || "codex";
+    // A background turn on one agent must not overwrite the quota card the user
+    // is currently looking at for the other.
+    if (source === effectiveProvider()) {
+      applyRateLimits(params, { notify: true, provider: source });
+    }
     return;
   }
 

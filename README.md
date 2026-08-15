@@ -28,7 +28,7 @@ many terminals.
   conversation. Claude runs non-interactively and follows its configured
   permission mode and permission rules.
 - Streams answers, tool activity, plans, file changes, and command output.
-- Supports native Codex Plan mode and persistent Goal mode, including goal
+- Supports Plan mode and persistent Goal mode for both providers, including goal
   pause, resume, edit, clear, and progress state.
 - Offers browser dictation that turns speech into editable prompt text.
 - Adaptively structures multi-part Codex answers with semantic Markdown
@@ -295,21 +295,30 @@ tool input/output, or other sensitive content.
 ## Slash commands
 
 Type `/` in the composer to open the command menu, then keep typing to filter
-the list or select a command with the keyboard, mouse, or touch.
+the list or select a command with the keyboard, mouse, or touch. The menu and
+`/help` only show commands supported by the active conversation's provider.
 
 | Command | Action |
 | --- | --- |
-| `/goal` | Create or edit a persistent goal for the current Codex conversation |
-| `/plan` | Toggle native Plan mode for subsequent Codex turns; `Shift+Tab` does the same in the composer |
-| `/compact` | Natively compact the current Codex context; available only for an existing, idle conversation |
+| `/goal` | Create or edit a persistent goal for the current conversation |
+| `/plan` | Toggle Plan mode for subsequent turns; `Shift+Tab` does the same in the composer |
+| `/compact` | Compact the current context; available only for an existing, idle conversation |
 | `/new` | Start a new conversation |
 | `/clear` | Clear the current view and start a fresh conversation |
 | `/resume` | Open the saved-conversation list |
 | `/status` | Show the current conversation status |
+| `/usage` | Show account quota, active limits, and reset times |
 | `/model` | Open model settings |
 | `/permissions` | Open the permission settings for the selected provider |
 | `/settings` | Open all conversation settings |
 | `/help` | Show the supported command list |
+
+Each provider backs these commands differently. Codex uses its native goal,
+collaboration-mode, compaction, and rate-limit APIs. For Claude, Plan mode maps
+to the `plan` permission mode, `/compact` runs the CLI's own compaction, and an
+active goal is restated to the CLI as a system prompt on every turn. Claude Code
+reports which quota window is active and when it resets, but not a used
+percentage, so `/usage` shows no progress bar for Claude conversations.
 
 Unknown slash commands are not sent to the model. Codex Web currently supports
 only the commands listed above, not every slash command available in the Codex
